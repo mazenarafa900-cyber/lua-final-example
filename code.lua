@@ -1,79 +1,72 @@
+
 --[[
 	CoreServer.lua
 
-	This script is the authoritative server-side controller for all persistent
-	player systems in the game. It centralizes economy, inventory, loadouts,
-	quests, consumables, and progression into a single controlled execution
-	context.
+	Authoritative server controller.
+	This script is the single source of truth for all persistent gameplay systems.
 
-	The design intentionally avoids trusting client-side state and instead
-	validates all gameplay actions through server logic. This ensures security,
-	consistency, and easier long-term maintenance.
+	Responsibilities:
+	- Economy & currency flow
+	- Inventory and tool ownership
+	- Loadout management
+	- Daily rewards
+	- Secure data persistence
+
+	Design rules:
+	- Clients may only REQUEST actions
+	- Server validates, executes, and saves
+	- No client-side state is trusted
 ]]
 
 ---------------------------------------------------------------------
 -- SERVICES
+-- Core Roblox services required for player lifecycle, storage, and timing
 ---------------------------------------------------------------------
 
--- Roblox services used throughout the script
 local Players = game:GetService("Players")
 local DataStoreService = game:GetService("DataStoreService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 
 ---------------------------------------------------------------------
--- DATASTORES & REMOTES
+-- DATASTORE & REMOTE GATEWAY
+-- One datastore, one RemoteEvent = predictable, auditable behavior
 ---------------------------------------------------------------------
 
--- Centralized DataStore for all persistent player data
--- Using a single structured save prevents partial or conflicting writes
+-- Single structured datastore prevents partial or conflicting saves
 local PlayerStore = DataStoreService:GetDataStore("PlayerData_v3")
 
--- RemoteEvent used as the only entry point for client → server communication
--- All gameplay actions must go through this event
+-- Sole client → server entry point
+-- Clients cannot perform actions directly; they may only request them
 local event = ReplicatedStorage:WaitForChild("core")
 
 ---------------------------------------------------------------------
 -- CONFIGURATION CONSTANTS
+-- Tunables are centralized to avoid magic numbers
 ---------------------------------------------------------------------
 
--- Autosave interval to reduce data loss while avoiding rate limits
-local AUTO_SAVE_INTERVAL = 60
-
--- Upper bound for any money transaction to prevent abuse
-local MAX_TRANSACTION = 1000
-
--- Maximum number of loadout slots per player
-local MAX_LOADOUT_SLOTS = 3
-
--- Tool granted to first-time players
-local DEFAULT_TOOL = "Sword"
-
--- Daily reward amount
-local DAILY_REWARD = 150
-
--- Default duration for time-based consumables
-local CONSUMABLE_DURATION = 20
-
--- Retry attempts for DataStore writes
-local SAVE_RETRIES = 3
+local AUTO_SAVE_INTERVAL = 60          -- Seconds between autosaves
+local MAX_TRANSACTION = 1000           -- Hard cap on money changes (anti-abuse)
+local MAX_LOADOUT_SLOTS = 3             -- Prevents unbounded loadout growth
+local DEFAULT_TOOL = "Sword"            -- Starter tool for new players
+local DAILY_REWARD = 150                -- Daily reward payout
+local CONSUMABLE_DURATION = 20          -- Default buff duration
+local SAVE_RETRIES = 3                  -- DataStore retry attempts
 
 ---------------------------------------------------------------------
 -- SHOP DEFINITION
+-- Server-validated catalog; UI never defines gameplay rules
 ---------------------------------------------------------------------
 
--- Central shop table defining all purchasable items
--- This allows validation without trusting client UI
 local Shop = {
-	Sword = {price = 200, type = "tool"},
-	Pistol = {price = 450, type = "tool"},
-	Grenade = {price = 250, type = "tool"},
-	MedKit = {price = 100, type = "consumable", heal = 50},
-	XPBoost = {price = 300, type = "consumable", multiplier = 2, duration = 30}
+	Sword   = { price = 200, type = "tool" },
+	Pistol  = { price = 450, type = "tool" },
+	Grenade = { price = 250, type = "tool" },
+	MedKit  = { price = 100, type = "consumable", heal = 50 },
+	XPBoost = { price = 300, type = "consumable", multiplier = 2, duration = 30 }
 }
 
--- Explicit allowlist for tools that can be equipped
--- Prevents arbitrary instances from being injected
+-- Explicit allowlist prevents arbitrary tool injection
 local AllowedTools = {
 	Sword = true,
 	Pistol = true,
@@ -81,17 +74,19 @@ local AllowedTools = {
 }
 
 ---------------------------------------------------------------------
--- RUNTIME STATE (SESSION ONLY)
+-- SESSION STATE (NON-PERSISTENT)
+-- Exists only while the player is online
 ---------------------------------------------------------------------
 
--- Server-side cache holding player data during a session
--- Acts as the single source of truth while the player is online
+-- Authoritative in-memory cache
+-- This is the source of truth during gameplay
 local PlayerDataCache = {}
 
--- Tracks active temporary buffs per player
+-- Active temporary effects (not saved)
 local ActiveBuffs = {}
 
--- Global analytics counters for internal insight
+-- Internal analytics for balancing and debugging
+-- Never used for gameplay logic
 local Analytics = {
 	TotalPurchases = 0,
 	TotalDaily = 0,
@@ -100,10 +95,9 @@ local Analytics = {
 
 ---------------------------------------------------------------------
 -- DATA INITIALIZATION
+-- Guarantees structural integrity of player data
 ---------------------------------------------------------------------
 
--- Default data template for new or corrupted player saves
--- Ensures all expected fields exist
 local function defaultPlayerData()
 	return {
 		Money = 0,
@@ -121,14 +115,14 @@ end
 
 ---------------------------------------------------------------------
 -- DATA PERSISTENCE
+-- Defensive saving with retries to survive throttling or outages
 ---------------------------------------------------------------------
 
--- Saves player data with retries to reduce DataStore failure impact
 local function savePlayerData(userId)
 	local data = PlayerDataCache[userId]
 	if not data then return end
 
-	for i = 1, SAVE_RETRIES do
+	for _ = 1, SAVE_RETRIES do
 		local success = pcall(function()
 			PlayerStore:SetAsync(tostring(userId), data)
 		end)
@@ -137,7 +131,6 @@ local function savePlayerData(userId)
 	end
 end
 
--- Loads player data from DataStore
 local function loadPlayerData(userId)
 	local success, data = pcall(function()
 		return PlayerStore:GetAsync(tostring(userId))
@@ -148,7 +141,6 @@ local function loadPlayerData(userId)
 	return nil
 end
 
--- Ensures player has valid data in cache
 local function ensurePlayerData(player)
 	local stored = loadPlayerData(player.UserId)
 	PlayerDataCache[player.UserId] = stored or defaultPlayerData()
@@ -157,9 +149,10 @@ end
 
 ---------------------------------------------------------------------
 -- ECONOMY LOGIC
+-- All currency changes flow through controlled functions
 ---------------------------------------------------------------------
 
--- Sanitizes numeric input to prevent malformed or abusive values
+-- Normalizes incoming numbers and enforces safety limits
 local function sanitizeAmount(amount)
 	amount = tonumber(amount) or 0
 	if amount < 0 then amount = 0 end
@@ -167,8 +160,7 @@ local function sanitizeAmount(amount)
 	return math.floor(amount)
 end
 
--- Adds money to a player's account
--- All income funnels through this function to allow tracking and quests
+-- Adds money after validation and tracking
 local function playerMoney(player, amount, reason)
 	amount = sanitizeAmount(amount)
 	if amount <= 0 then return false end
@@ -183,7 +175,7 @@ local function playerMoney(player, amount, reason)
 	return true
 end
 
--- Removes money after validating sufficient balance
+-- Removes money only if balance allows it
 local function deductMoney(player, amount)
 	amount = sanitizeAmount(amount)
 	local data = PlayerDataCache[player.UserId]
@@ -194,26 +186,27 @@ end
 
 ---------------------------------------------------------------------
 -- INVENTORY MANAGEMENT
+-- Ownership is tracked logically, tools are spawned physically
 ---------------------------------------------------------------------
 
--- Adds an item to a player's inventory
 local function addToInventory(player, itemName)
 	local data = PlayerDataCache[player.UserId]
 	if not data or not Shop[itemName] then return false end
+
+	-- Prevent duplicate tool ownership
 	if Shop[itemName].type == "tool" and table.find(data.Inventory, itemName) then
 		return false
 	end
+
 	table.insert(data.Inventory, itemName)
 	return true
 end
 
--- Checks inventory ownership
 local function ownsItem(player, itemName)
 	local data = PlayerDataCache[player.UserId]
 	return data and table.find(data.Inventory, itemName) ~= nil
 end
 
--- Gives a physical Tool instance from ReplicatedStorage
 local function giveToolInstance(player, toolName)
 	local template = ReplicatedStorage:FindFirstChild(toolName)
 	if not template then return false end
@@ -223,10 +216,9 @@ end
 
 ---------------------------------------------------------------------
 -- SHOP / PURCHASE FLOW
+-- Server validates price, ownership, and balance
 ---------------------------------------------------------------------
 
--- Handles server-side item purchases
--- Validates price, ownership, and balance
 local function buyItem(player, itemName)
 	local data = PlayerDataCache[player.UserId]
 	local item = Shop[itemName]
@@ -249,9 +241,9 @@ end
 
 ---------------------------------------------------------------------
 -- LOADOUT SYSTEM
+-- Only owned and explicitly allowed tools may be equipped
 ---------------------------------------------------------------------
 
--- Saves a filtered loadout slot
 local function saveLoadout(player, slot, tools)
 	local data = PlayerDataCache[player.UserId]
 	if not data or slot < 1 or slot > MAX_LOADOUT_SLOTS then return false end
@@ -267,7 +259,6 @@ local function saveLoadout(player, slot, tools)
 	return true
 end
 
--- Equips a saved loadout
 local function equipLoadout(player, slot)
 	local data = PlayerDataCache[player.UserId]
 	local loadout = data and data.Loadouts[slot]
@@ -281,26 +272,29 @@ end
 
 ---------------------------------------------------------------------
 -- DAILY REWARD
+-- Time-gated reward enforced strictly server-side
 ---------------------------------------------------------------------
 
--- Allows once-per-day reward claims and cant be bypassed
 local function claimDaily(player)
 	local data = PlayerDataCache[player.UserId]
 	local now = os.time()
+
+	-- 24 hour cooldown, cannot be bypassed by rejoining
 	if now - data.LastDaily >= 86400 then
 		playerMoney(player, DAILY_REWARD, "daily")
 		data.LastDaily = now
 		Analytics.TotalDaily += 1
 		return true
 	end
+
 	return false
 end
 
 ---------------------------------------------------------------------
 -- REMOTE EVENT HANDLER
+-- Single validated request router
 ---------------------------------------------------------------------
 
--- Single validated entry point for all client requests on the server
 event.OnServerEvent:Connect(function(player, action, payload)
 	if action == "BuyItem" then buyItem(player, payload) end
 	if action == "SaveLoadout" then saveLoadout(player, payload.slot, payload.tools) end
@@ -311,20 +305,23 @@ end)
 
 ---------------------------------------------------------------------
 -- PLAYER LIFECYCLE
+-- Session bootstrap and teardown
 ---------------------------------------------------------------------
 
--- Initializes player session for better gameplay and layout
 Players.PlayerAdded:Connect(function(player)
 	local data = ensurePlayerData(player)
 
+	-- Ensure loadout slots always exist
 	for i = 1, MAX_LOADOUT_SLOTS do
 		data.Loadouts[i] = data.Loadouts[i] or {}
 	end
 
+	-- Grant starter item to new players
 	if #data.Inventory == 0 then
 		addToInventory(player, DEFAULT_TOOL)
 	end
 
+	-- Rebuild inventory safely
 	for _, item in ipairs(data.Inventory) do
 		if Shop[item] and Shop[item].type == "tool" then
 			giveToolInstance(player, item)
@@ -332,14 +329,14 @@ Players.PlayerAdded:Connect(function(player)
 	end
 end)
 
--- Saves player data on exit for maximum security on the data saving process
 Players.PlayerRemoving:Connect(function(player)
 	savePlayerData(player.UserId)
 	PlayerDataCache[player.UserId] = nil
 end)
 
 ---------------------------------------------------------------------
--- AUTOSAVE LOOP FOR BETTER SECURITY AND INTERNET ISSUES
+-- AUTOSAVE LOOP
+-- Periodic persistence to reduce data loss risk
 ---------------------------------------------------------------------
 
 task.spawn(function()
